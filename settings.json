@@ -6,9 +6,9 @@
     "type": "offline"
   },
   "server": {
-    "ip": " vitasalt.aternos.me",
+    "ip": "vitasalt.aternos.me",
     "port": 18968,
-    "version": "26.1.2",
+    "version": false,
     "try-creative": false
   },
   "position": {
@@ -27,13 +27,11 @@
       "sneak": true
     },
     "chat-messages": {
-      "enabled": false,
-      "repeat": false,
+      "enabled": true,
+      "repeat": true,
       "repeat-delay": 120,
       "messages": [
-        "I'm a regular player",
-        "Subscribe to Slobos!",
-        "I like to play Minecraft!"
+        "aku adalah tuyul serper"
       ]
     },
     "chat-log": true,

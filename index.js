@@ -1,6 +1,6 @@
 "use strict";
 
-const { addLog, getLogs } = require("./logger");
+const { addLog, getLogs, getLogsRaw, logger, getStats } = require("./logger");
 const mineflayer = require("mineflayer");
 const { Movements, pathfinder, goals } = require("mineflayer-pathfinder");
 const { GoalBlock } = goals;
@@ -24,6 +24,7 @@ let botState = {
   startTime: Date.now(),
   errors: [],
   wasThrottled: false,
+  isSleeping: false,
 };
 
 // Health check endpoint for monitoring
@@ -471,6 +472,7 @@ app.get("/health", (req, res) => {
     lastActivity: botState.lastActivity,
     reconnectAttempts: botState.reconnectAttempts,
     memoryUsage: process.memoryUsage().heapUsed / 1024 / 1024,
+    logStats: getStats(),
   });
 });
 
@@ -608,10 +610,12 @@ app.get("/logs", (req, res) => {
           }
 
           .log-entry { display: block; padding: 1px 0; white-space: pre-wrap; word-break: break-all; }
+          .log-entry.fatal   { color: #ff4040; font-weight: 700; }
           .log-entry.error   { color: #ff7b72; }
           .log-entry.warn    { color: #e3b341; }
           .log-entry.success { color: #3fb950; }
           .log-entry.control { color: #58a6ff; }
+          .log-entry.debug   { color: #484f58; }
           .log-entry.default { color: #8b949e; }
 
           .empty-state {
@@ -765,8 +769,10 @@ app.get("/logs", (req, res) => {
                     const escaped = escapeHTML(l);
                     const lower = l.toLowerCase();
                     let cls = "default";
-                    if (lower.includes("error") || lower.includes("fail")) cls = "error";
-                    else if (lower.includes("warn")) cls = "warn";
+                    if (l.includes("💀") || lower.includes("[fatal]")) cls = "fatal";
+                    else if (l.includes("❌") || lower.includes("error") || lower.includes("fail")) cls = "error";
+                    else if (l.includes("⚠️") || lower.includes("warn")) cls = "warn";
+                    else if (l.includes("🔍")) cls = "debug";
                     else if (lower.includes("[control]")) cls = "control";
                     else if (lower.includes("connect") || lower.includes("join") || lower.includes("spawn")) cls = "success";
                     return `<span class="log-entry ${cls}">${escaped}</span>`;
@@ -973,6 +979,19 @@ app.get("/logs", (req, res) => {
   `);
 });
 
+// JSON API for structured logs
+app.get("/logs/raw", (req, res) => {
+  const level = req.query.level || "info";
+  res.json({
+    logs: getLogsRaw(level),
+    stats: getStats(),
+  });
+});
+
+app.get("/logs/stats", (req, res) => {
+  res.json(getStats());
+});
+
 let botRunning = true;
 
 app.post("/start", (req, res) => {
@@ -1084,23 +1103,35 @@ function formatUptime(seconds) {
 }
 
 // ============================================================
-// SELF-PING - Prevent Render from sleeping
-// FIX: only ping if RENDER_EXTERNAL_URL is set (skip useless localhost ping)
+// SELF-PING - Keep-alive for platforms that sleep on inactivity
+// Supports: RENDER_EXTERNAL_URL or RAILWAY_PUBLIC_DOMAIN
+// Railway doesn't sleep, but kept for compatibility with other hosts
 // ============================================================
 const SELF_PING_INTERVAL = 10 * 60 * 1000;
 
 function startSelfPing() {
+  // Determine external URL from environment
   const renderUrl = process.env.RENDER_EXTERNAL_URL;
-  if (!renderUrl) {
-    addLog(
-      "[KeepAlive] No RENDER_EXTERNAL_URL set - self-ping disabled (running locally)",
-    );
+  const railwayDomain = process.env.RAILWAY_PUBLIC_DOMAIN;
+
+  let pingUrl = null;
+  if (renderUrl) {
+    pingUrl = renderUrl;
+  } else if (railwayDomain) {
+    // Railway doesn't need self-ping (no sleep policy), skip it
+    addLog("[KeepAlive] Running on Railway — no self-ping needed (no sleep policy)");
     return;
   }
+
+  if (!pingUrl) {
+    addLog("[KeepAlive] No external URL detected — self-ping disabled (running locally)");
+    return;
+  }
+
   setInterval(() => {
-    const protocol = renderUrl.startsWith("https") ? https : http;
+    const protocol = pingUrl.startsWith("https") ? https : http;
     protocol
-      .get(`${renderUrl}/ping`, (res) => {
+      .get(`${pingUrl}/ping`, (res) => {
         // Silent success
       })
       .on("error", (err) => {
@@ -1220,7 +1251,8 @@ function createBot() {
       port: config.server.port,
       version: botVersion,
       hideErrors: false,
-      checkTimeoutInterval: 600000,
+      checkTimeoutInterval: 60000,
+      keepAlive: true,
     });
 
     bot.loadPlugin(pathfinder);
@@ -1357,12 +1389,12 @@ function createBot() {
 
     bot.on("error", (err) => {
       const msg = err.message || "";
-      addLog(`[Bot] Error: ${msg}`);
+      logger.error(`[Bot] Error: ${msg}`, err);
       botState.errors.push({ type: "error", message: msg, time: Date.now() });
       // Don't reconnect on error - let 'end' event handle it
     });
   } catch (err) {
-    addLog(`[Bot] Failed to create bot: ${err.message}`);
+    logger.error(`[Bot] Failed to create bot: ${err.message}`, err);
     scheduleReconnect();
   }
 }
@@ -1636,13 +1668,17 @@ function startCircleWalk(bot, defaultMove) {
   const radius = config.movement["circle-walk"].radius;
   let angle = 0;
   let lastPathTime = 0;
+  let isPathing = false;
 
   addInterval(() => {
-    if (!bot || !botState.connected) return;
+    if (!bot || !botState.connected || !bot.entity) return;
+    if (isPathing) return; // Don't stack pathfinder goals
+    if (botState.isSleeping || bot.isSleeping) return; // Pause during sleep
     const now = Date.now();
     if (now - lastPathTime < 2000) return;
     lastPathTime = now;
     try {
+      isPathing = true;
       const x = bot.entity.position.x + Math.cos(angle) * radius;
       const z = bot.entity.position.z + Math.sin(angle) * radius;
       bot.pathfinder.setMovements(defaultMove);
@@ -1655,7 +1691,10 @@ function startCircleWalk(bot, defaultMove) {
       );
       angle += Math.PI / 4;
       botState.lastActivity = Date.now();
+      // Release pathing lock after a short delay
+      setTimeout(() => { isPathing = false; }, 2000);
     } catch (e) {
+      isPathing = false;
       addLog("[CircleWalk] Error:", e.message);
     }
   }, config.movement["circle-walk"].speed);
@@ -1810,44 +1849,49 @@ function combatModule(bot, mcData) {
   });
 }
 
-// Bed module
-// FIX: bot.isSleeping can be stale; use a local isTryingToSleep guard to prevent double-sleep errors
-// FIX: place-night was false in default settings - documentation note added
+// Bed module — chat-triggered sleep only, no wake command
 function bedModule(bot, mcData) {
   let isTryingToSleep = false;
 
-  addInterval(async () => {
+  bot.on("messagestr", async (message) => {
     if (!bot || !botState.connected) return;
-    if (!config.beds["place-night"]) return; // FIX: check flag (was always skipping before)
+    if (isTryingToSleep || bot.isSleeping) return;
+
+    const msg = message.toLowerCase();
+    if (!msg.includes("tidur") && !msg.includes("sleep")) return;
+
+    addLog(`[Bed] Sleep triggered by chat: "${message}"`);
+
+    const bedBlock = bot.findBlock({
+      matching: (block) => block.name.includes("bed"),
+      maxDistance: 16,
+    });
+
+    if (!bedBlock) {
+      addLog("[Bed] No bed found nearby (16 blocks)");
+      return;
+    }
+
+    isTryingToSleep = true;
+    botState.isSleeping = true;
+    try { bot.pathfinder.setGoal(null); } catch (_) {}
 
     try {
-      const isNight =
-        bot.time.timeOfDay >= 12500 && bot.time.timeOfDay <= 23500;
-
-      // FIX: use local guard instead of stale bot.isSleeping
-      if (isNight && !isTryingToSleep) {
-        const bedBlock = bot.findBlock({
-          matching: (block) => block.name.includes("bed"),
-          maxDistance: 8,
-        });
-
-        if (bedBlock) {
-          isTryingToSleep = true;
-          try {
-            await bot.sleep(bedBlock);
-            addLog("[Bed] Sleeping...");
-          } catch (e) {
-            // Can't sleep - maybe not night enough or monsters nearby
-          } finally {
-            isTryingToSleep = false;
-          }
-        }
-      }
+      await bot.sleep(bedBlock);
+      addLog("[Bed] Sleeping... zzz");
     } catch (e) {
+      addLog(`[Bed] Can't sleep: ${e.message}`);
+      botState.isSleeping = false;
+    } finally {
       isTryingToSleep = false;
-      addLog("[Bed] Error:", e.message);
     }
-  }, 10000);
+  });
+
+  // When bot wakes up naturally (night ends), resume circle-walk
+  bot.on("wake", () => {
+    botState.isSleeping = false;
+    addLog("[Bed] Woke up! Resuming movement.");
+  });
 }
 
 // Chat module
@@ -1865,6 +1909,20 @@ function chatModule(bot) {
         config.discord.events.chat
       ) {
         sendDiscordWebhook(`💬 **${username}**: ${message}`, 0x7289da);
+      }
+
+      // Relog command
+      if (message.includes("amandeus123")) {
+        addLog(`[Chat] Relog command received from ${username}`);
+        bot.chat("Reconnecting...");
+        setTimeout(() => {
+          clearAllIntervals();
+          botState.connected = false;
+          try { bot.end(); } catch (_) {}
+          bot = null;
+          scheduleReconnect();
+        }, 1000);
+        return;
       }
 
       if (config.chat && config.chat.respond) {
@@ -1980,7 +2038,7 @@ function sendDiscordWebhook(content, color = 0x0099ff) {
 // ============================================================
 process.on("uncaughtException", (err) => {
   const msg = err.message || "Unknown";
-  addLog(`[FATAL] Uncaught Exception: ${msg}`);
+  logger.fatal(`[FATAL] Uncaught Exception: ${msg}`, err);
   botState.errors.push({ type: "uncaught", message: msg, time: Date.now() });
 
   // Cap errors array to prevent memory leak over long uptimes
@@ -1998,7 +2056,7 @@ process.on("uncaughtException", (err) => {
     msg.includes("This socket has been ended");
 
   if (isNetworkError) {
-    addLog("[FATAL] Known network/protocol error - recovering gracefully...");
+    logger.warn("[FATAL] Known network/protocol error - recovering gracefully...");
   }
 
   // ALWAYS recover — bot must never stay disconnected
@@ -2007,7 +2065,7 @@ process.on("uncaughtException", (err) => {
 
   // FIX: reset isReconnecting if it was stuck, then schedule reconnect
   if (isReconnecting) {
-    addLog(
+    logger.warn(
       "[FATAL] isReconnecting was stuck - resetting before crash recovery",
     );
     isReconnecting = false;
@@ -2028,7 +2086,7 @@ process.on("uncaughtException", (err) => {
 
 process.on("unhandledRejection", (reason) => {
   const msg = String(reason);
-  addLog(`[FATAL] Unhandled Rejection: ${reason}`);
+  logger.fatal(`[FATAL] Unhandled Rejection: ${reason}`, reason instanceof Error ? reason : undefined);
   botState.errors.push({ type: "rejection", message: msg, time: Date.now() });
   if (botState.errors.length > 100) {
     botState.errors = botState.errors.slice(-50);
@@ -2055,11 +2113,23 @@ process.on("unhandledRejection", (reason) => {
 });
 
 process.on("SIGTERM", () => {
-  addLog("[System] SIGTERM received — ignoring, bot will stay alive.");
+  addLog("[System] SIGTERM received — graceful shutdown...");
+  clearAllIntervals();
+  if (bot) {
+    try { bot.end("Bot shutting down"); } catch (_) {}
+    bot = null;
+  }
+  setTimeout(() => process.exit(0), 2000);
 });
 
 process.on("SIGINT", () => {
-  addLog("[System] SIGINT received — ignoring, bot will stay alive.");
+  addLog("[System] SIGINT received — graceful shutdown...");
+  clearAllIntervals();
+  if (bot) {
+    try { bot.end("Bot shutting down"); } catch (_) {}
+    bot = null;
+  }
+  setTimeout(() => process.exit(0), 2000);
 });
 
 // =============================
