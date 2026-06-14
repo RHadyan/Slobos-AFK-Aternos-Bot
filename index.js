@@ -24,6 +24,7 @@ let botState = {
   startTime: Date.now(),
   errors: [],
   wasThrottled: false,
+  wasDuplicateKick: false,
   isSleeping: false,
 };
 
@@ -1204,8 +1205,18 @@ function getReconnectDelay() {
     return throttleDelay;
   }
 
+  // FIX: if kicked for "another location", wait longer so server fully releases the old session
+  if (botState.wasDuplicateKick) {
+    botState.wasDuplicateKick = false;
+    const dupDelay = 10000 + Math.floor(Math.random() * 5000); // 10-15s
+    addLog(
+      `[Bot] Duplicate session detected - using extended delay: ${dupDelay / 1000}s`,
+    );
+    return dupDelay;
+  }
+
   // FIX: read auto-reconnect-delay from settings as base delay
-  const baseDelay = config.utils["auto-reconnect-delay"] || 3000;
+  const baseDelay = config.utils["auto-reconnect-delay"] || 5000;
   const maxDelay = config.utils["max-reconnect-delay"] || 30000;
   const delay = Math.min(
     baseDelay * Math.pow(2, botState.reconnectAttempts),
@@ -1215,7 +1226,7 @@ function getReconnectDelay() {
   return delay + jitter;
 }
 
-function createBot() {
+async function createBot() {
   if (isReconnecting) {
     addLog("[Bot] Already reconnecting, skipping...");
     return;
@@ -1231,6 +1242,12 @@ function createBot() {
       addLog("[Cleanup] Error ending previous bot:", e.message);
     }
     bot = null;
+
+    // FIX: Wait for the server to fully release the old session before connecting again.
+    // Without this delay, the new connection arrives while the old one is still being torn down,
+    // causing "You logged in from another location" kick loops.
+    addLog("[Bot] Waiting 5s for server to release old session...");
+    await new Promise((resolve) => setTimeout(resolve, 5000));
   }
 
   addLog(`[Bot] Creating bot instance...`);
@@ -1353,6 +1370,18 @@ function createBot() {
           "[Bot] Throttle kick detected - will use extended reconnect delay",
         );
         botState.wasThrottled = true;
+      }
+
+      // FIX: detect "logged in from another location" loop and use longer delay
+      if (
+        reasonStr.includes("another location") ||
+        reasonStr.includes("logged in from another") ||
+        reasonStr.includes("you logged in")
+      ) {
+        addLog(
+          "[Bot] Duplicate session kick detected - using extended delay to avoid loop",
+        );
+        botState.wasDuplicateKick = true;
       }
 
       if (
@@ -2059,28 +2088,31 @@ process.on("uncaughtException", (err) => {
     logger.warn("[FATAL] Known network/protocol error - recovering gracefully...");
   }
 
-  // ALWAYS recover — bot must never stay disconnected
+  // FIX: If a reconnect is already scheduled, DON'T interfere — let it proceed.
+  // The old code would reset isReconnecting and schedule ANOTHER reconnect,
+  // causing duplicate connections and "logged in from another location" loops.
+  if (isReconnecting || reconnectTimeoutId) {
+    logger.warn(
+      "[FATAL] Reconnect already in progress — not scheduling another one.",
+    );
+    return;
+  }
+
+  // Only recover if bot is not already reconnecting
   clearAllIntervals();
   botState.connected = false;
 
-  // FIX: reset isReconnecting if it was stuck, then schedule reconnect
-  if (isReconnecting) {
-    logger.warn(
-      "[FATAL] isReconnecting was stuck - resetting before crash recovery",
-    );
-    isReconnecting = false;
-    // BUG FIX: was referencing non-existent 'reconnectTimeout' — correct name is 'reconnectTimeoutId'
-    if (reconnectTimeoutId) {
-      clearTimeout(reconnectTimeoutId);
-      reconnectTimeoutId = null;
-    }
+  // Safely end the current bot if it exists
+  if (bot) {
+    try { bot.removeAllListeners(); bot.end(); } catch (_) {}
+    bot = null;
   }
 
   setTimeout(
     () => {
       scheduleReconnect();
     },
-    isNetworkError ? 5000 : 10000,
+    isNetworkError ? 10000 : 15000,
   );
 });
 
@@ -2100,15 +2132,19 @@ process.on("unhandledRejection", (reason) => {
     msg.includes("timed out") ||
     msg.includes("PartialReadError");
 
-  if (isNetworkError && !isReconnecting) {
+  // FIX: Also check reconnectTimeoutId to avoid scheduling duplicate reconnects
+  if (isNetworkError && !isReconnecting && !reconnectTimeoutId) {
     addLog("[FATAL] Network rejection — triggering reconnect...");
     clearAllIntervals();
     botState.connected = false;
     if (bot) {
-      try { bot.end(); } catch (_) {}
+      try { bot.removeAllListeners(); bot.end(); } catch (_) {}
       bot = null;
     }
-    scheduleReconnect();
+    // Use longer delay to avoid race conditions
+    setTimeout(() => {
+      scheduleReconnect();
+    }, 10000);
   }
 });
 
