@@ -6,8 +6,8 @@
     "type": "offline"
   },
   "server": {
-    "ip": "vitasalt.aternos.me",
-    "port": 18968,
+    "ip": "ParkerPride.aternos.me",
+    "port": 60035,
     "version": false,
     "try-creative": false
   },
