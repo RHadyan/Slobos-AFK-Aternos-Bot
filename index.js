@@ -1898,6 +1898,7 @@ function bedModule(bot, mcData) {
 
     if (!bedBlock) {
       addLog("[Bed] No bed found nearby (16 blocks)");
+      bot.chat("Ga bisa tidur — ga ada bed dalam radius 16 block");
       return;
     }
 
@@ -1908,8 +1909,10 @@ function bedModule(bot, mcData) {
     try {
       await bot.sleep(bedBlock);
       addLog("[Bed] Sleeping... zzz");
+      bot.chat("Zzz... tidur~");
     } catch (e) {
       addLog(`[Bed] Can't sleep: ${e.message}`);
+      bot.chat(`Ga bisa tidur: ${e.message}`);
       botState.isSleeping = false;
     } finally {
       isTryingToSleep = false;
